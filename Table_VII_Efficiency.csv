@@ -1,0 +1,6 @@
+Method,Analysis Type,One-Stage Time (s),Two-Stage Time (s),Transformer Time (s)
+D-RISE,Perturbation,15.21,18.45,22.10
+ODAM,-,10.35,0.42,-
+CRAFT,NMF Concept Discovery,0.82,0.90,0.98
+COE,Circuit Discovery,N/A,N/A,1.65
+RCE (Ours),Concept Intervention,0.75,0.82,0.95

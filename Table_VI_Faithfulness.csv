@@ -1,0 +1,8 @@
+Method,Metric,One-Stage (YOLOv5),Two-Stage (Faster R-CNN),Transformer (DETR),Average
+D-RISE,AOC,0.45,0.42,0.49,0.45
+Finer-CAM,AOC,0.51,0.48,N/A,0.5
+ODAM,AOC,0.38,0.4,0.42,0.4
+GCE,AOC,0.43,0.45,0.47,0.45
+CoE,AOC,N/A,N/A,0.43,N/A
+CRAFT,AOC,0.48,0.46,0.52,0.49
+RCE (Ours),AOC,0.25,0.23,0.27,0.25

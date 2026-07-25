@@ -1,0 +1,6 @@
+Method,AUC-ROC ↑,Human Alignment (%) ↑
+Finer-CAM,0.755,61.8
+D-RISE,0.782,65.4
+CRAFT,0.815,71.2
+COE,0.831,74.5
+RCE (Ours),0.913,92.5
