@@ -1,599 +1,322 @@
-# RCE Shared-Detector Baseline Benchmark
+# PIE: Pair-level Interventional Explanation
 
-A reproducible benchmark for comparing **Relational Concept Explainer (RCE)** outputs with representative XAI baselines on the **same frozen object detector, the same image, and the same selected object pair**.
+**Beyond Single-Object Saliency: Explaining Joint Object-Pair Confidence via Latent Evidence Interventions**
 
-The repository is designed for qualitative comparison and research reproducibility. It does not manually sharpen, recolor, or edit one method differently from another. Every supplied heatmap is resized, normalized, and visualized through one shared pipeline.
 
----
 
-## 1. What this repository does
+## Overview
 
-The current implementation uses a frozen **torchvision Faster R-CNN ResNet-50 FPN v2** detector and explains a selected `person--bicycle` pair.
+Object detectors are usually explained one detection at a time, yet many downstream decisions depend on **two detections together**. PIE is a post-hoc framework that explains the **joint confidence** of a selected detection pair in a **frozen** detector:
 
-The pipeline:
+$$S_{ij} = s_i \, s_j$$
 
-1. Loads an input image.
-2. Detects the target person and bicycle, or accepts manually supplied boxes.
-3. Keeps the detector parameters frozen.
-4. Generates pair-level maps for:
-   - D-RISE;
-   - ODAM-style fixed-ROI gradients;
-   - detector-adapted Finer-CAM.
-5. Loads externally generated maps for:
-   - RCE;
-   - official CRAFT output.
-6. Applies the same resizing, normalization, opacity, and figure layout to all methods.
-7. Saves publication-ready PDF and PNG figures, raw NumPy maps, and a metadata JSON file.
+When an intervention changes the two scores by $\Delta s_i$ and $\Delta s_j$, the joint confidence changes by
 
-> **Important:** This benchmark package does not silently replace official CRAFT or the full RCE pipeline with simplified approximations. RCE and CRAFT maps are provided as inputs through `--rce-map` and `--craft-map`.
+$$\Delta S_{ij} = s_j\,\Delta s_i + s_i\,\Delta s_j + \Delta s_i\,\Delta s_j .$$
 
----
+The cross term $\Delta s_i\Delta s_j$ is non-zero only when the same evidence affects both detections. Merged object-wise maps and first-order (gradient) attributions cannot represent it. PIE measures $\Delta S_{ij}$ directly, so the cross term is included by construction.
 
-## 2. Why one shared detector is important
+**Key properties**
 
-A visual comparison is not fair when different methods use different detectors, target objects, image sizes, or normalization rules. This repository controls those variables by using:
+- Explains the joint confidence of a detection pair, not a single score.
+- Ranks image-specific latent evidence units by their **measured** drop in $S_{ij}$, not by activation or gradient.
+- Pair-preserving one-to-one IoU matching keeps the explanation defined when detections shift or disappear.
+- Works with one-stage (YOLOv5), two-stage (Faster R-CNN) and transformer-based (DETR) detectors through readout adapters, **without retraining**.
+- Needs only $K+1$ forward passes per pair (9 passes with $K=8$), under one second per pair.
 
-- one frozen Faster R-CNN detector;
-- one fixed target pair;
-- one target feature layer for gradient-based methods;
-- one image resolution;
-- one heatmap normalization function;
-- one overlay opacity;
-- one output layout.
-
-The detector is used only for inference and explanation. Its weights are not retrained or fine-tuned.
+> **Scope.** PIE explains detector confidence for object pairs. It does **not** predict, explain, or verify predicates or semantic relationships.
 
 ---
 
-## 3. Pair-level explanation target
+## Method
 
-For the selected object pair, the shared relational score is based on the confidence of both target detections.
+PIE has four stages:
 
-For fixed-ROI gradient methods, the pair probability is computed as:
+1. **Target-pair definition.** Select two detections $d_i, d_j$ and compute their union box $b_{ij}$ and pixel region $\Omega_{ij}$. All interventions stay inside $\Omega_{ij}$.
+2. **Detector-family feature readout.** Read features from a fixed layer of the frozen detector inside the union region:
+   | Detector family | Model | Readout | Layer |
+   |---|---|---|---|
+   | One-stage | YOLOv5x | Grid sampling | PANet neck P4 (stride 16) |
+   | Two-stage | Faster R-CNN R101-FPN | ROI-Align on $b_{ij}$ ($7\times7$, sampling ratio 2) | FPN level P2–P5 chosen by the standard level-assignment rule |
+   | Transformer | DETR-DC5 R50 | Encoder tokens inside $\Omega_{ij}$ | 6th encoder layer |
+3. **Latent evidence units.** K-Means groups the located features into $K$ prototypes; a temperature softmax gives unit maps $U_k$ that are resampled to pixel maps $\widetilde{U}_k$ inside $\Omega_{ij}$.
+4. **Interventional ranking.** Each map is thresholded at its 85th percentile to give a mask $M_k$ (strongest 15%). The masked pixels are replaced with a Gaussian-blurred copy of the image, the detector is re-run, the two targets are recovered by same-class one-to-one IoU matching ($\theta_m = 0.5$), and each unit is scored by
 
-```text
-pair_score = probability(person) × probability(bicycle)
-```
+   $$CE_k = S_{ij}(I) - \widehat{s}'_{i,k}\,\widehat{s}'_{j,k}.$$
 
-For D-RISE, the two instance-similarity values are multiplied for each random mask. A mask receives a high weight only when it preserves evidence for both selected objects.
+   An unmatched target is treated as lost (score 0). Units are sorted by $CE_k$ (negative effects are kept, not clipped).
 
-This makes the comparison pair-oriented rather than producing two unrelated single-object explanations.
-
----
-
-## 4. Important note about K-Means concept IDs
-
-RCE uses unsupervised clustering to discover image-specific latent concepts. K-Means cluster numbers are **permutation-invariant**. Therefore, labels such as `Concept 1`, `Concept 2`, or `Concept 3` are not permanent semantic identities.
-
-For example, two runs may produce:
-
-```text
-Run 1: Concept 1 = pedal region
-Run 2: Concept 4 = pedal region
-```
-
-This label change does not necessarily mean that the explanation has changed. The underlying spatial concept and its interventional importance may remain equivalent even when the numeric cluster ID changes.
-
-### Correct interpretation
-
-Concept stability should be checked using:
-
-- spatial overlap of activation maps;
-- dominant activated region;
-- concept-effect score;
-- ranking consistency;
-- deletion/AOC behavior;
-- similarity after optimal cluster matching.
-
-Concept stability should **not** be judged only by comparing raw cluster numbers.
-
-### Across different images
-
-A concept index is local to one image and one selected object pair. `Concept 1` in one image is not assumed to represent the same visual evidence as `Concept 1` in another image.
-
-### Reproducible clustering
-
-For repeatable RCE map generation, use a fixed seed and multiple K-Means initializations:
-
-```python
-from sklearn.cluster import KMeans
-
-kmeans = KMeans(
-    n_clusters=8,
-    random_state=17,
-    n_init=20,
-)
-```
-
-A fixed seed improves run-to-run repeatability, but the scientific interpretation should still depend on spatial evidence and concept-effect ranking rather than the numeric cluster label.
-
-> Do not claim that clustering is always identical or always correct. The defensible statement is that **cluster IDs may permute while the spatial explanation and interventional ranking can remain functionally consistent**.
+For display only, the top-ranked mask can be refined with DeepLabV3. This refinement does **not** affect $CE_k$.
 
 ---
 
-## 5. Method status
+## Default configuration
 
-### D-RISE
+All detectors and both datasets use the same settings (paper, Table V):
 
-Implemented as a black-box perturbation method for object detection. Random masks are applied to the image, and each mask is weighted using the product of the two target-instance similarities.
-
-### ODAM
-
-Implemented as a paper-based, fixed-ROI gradient adaptation. The target boxes are held fixed, passed through ROIAlign and the frozen classification head, and explained using the pair probability.
-
-This implementation should be described as an **ODAM-style or paper-based adaptation**, not as an official repository reproduction unless it is independently validated against an official implementation.
-
-### Finer-CAM
-
-Implemented using a detector-adapted contrastive objective over fixed ROI logits. For each target ROI, the target-class logit is contrasted with strong non-target reference logits.
-
-Because the original method is class-logit oriented, the object-pair adaptation must be disclosed in any manuscript or report.
-
-### CRAFT
-
-CRAFT requires an appropriate model split and a calibration image collection. This repository accepts an externally generated official CRAFT heatmap through:
-
-```text
---craft-map results/craft_official.npy
-```
-
-Do not label a CRAFT panel as official unless it was produced using the official CRAFT implementation and a documented calibration protocol.
-
-### RCE
-
-The benchmark accepts the raw RCE heatmap through:
-
-```text
---rce-map results/rce.npy
-```
-
-The RCE map should be exported before manual contrast adjustment or figure editing. The shared visualization pipeline performs the final normalization.
+| Parameter | Symbol | Value |
+|---|---|---|
+| Number of latent units | $K$ | 8 |
+| Softmax temperature | $\tau_s$ | 0.05 |
+| Mask percentile | – | 85 (keeps strongest 15%) |
+| Gaussian blur scale | $\sigma$ | 15 |
+| Matching IoU threshold | $\theta_m$ | 0.50 |
+| ROI-Align grid (Faster R-CNN only) | $G$ | $7\times7$ |
+| Detector confidence threshold | – | 0.25 |
+| NMS IoU threshold | – | 0.50 |
+| Max detections per image | – | 100 |
 
 ---
 
-## 6. Repository structure
+## Repository contents
 
-```text
-rce_baseline_benchmark/
-├── baseline_xai/
-│   ├── __init__.py
-│   ├── common.py
-│   ├── detector.py
-│   ├── drise.py
-│   ├── gradient_methods.py
-│   └── visualize.py
-├── data/
-│   └── person_bicycle.jpg
-├── results/
-│   ├── rce.npy
-│   └── craft_official.npy
-├── outputs/
-├── run_comparison.py
-├── requirements.txt
-├── CAPTION.tex
-└── README.md
-```
+| File | Description |
+|---|---|
+| `pie_full_eval_colab.py` | Full PIE evaluation pipeline (pair-level MoRF deletion, insertion, ablations) — runs on Google Colab or a local GPU |
+| `pie_fig15_grid_v2.py` | Builds the multi-example qualitative figure (selected pair, union region, top-ranked unit, $CE_k$ ranking) |
+| `demo_rce.py` | Single-image demo of PIE on one detection pair |
+| `comperision.py` | Qualitative comparison of PIE with D-RISE, ODAM, Finer-CAM and CRAFT on the same image and pair |
+| `Testing Bench Mark.ipynb` | Notebook for the benchmark runs |
+| `pie-xai.zip`, `RCE.zip` | Packaged source code |
+| `RCE_Non intrection experiments.zip` | Visual Genome predicate-annotated vs. non-annotated pair experiment |
+| `Table_VI_Faithfulness.csv` | MoRF-AUC results (paper Table VI) |
+| `Table_VII_Efficiency.csv` | Explanation time per pair (paper Table X) |
+| `*.png` | Example outputs and figures |
 
-The `data/` and `results/` directories may be created by the user if they are not already present.
+> **Note:** "RCE" is the earlier working name of the method. It refers to the same method as **PIE** in the paper.
 
 ---
 
-## 7. Installation
+## Installation
 
-### Requirements
-
-- Python 3.10 or newer;
-- PyTorch 2.2 or newer;
-- torchvision 0.17 or newer;
-- NumPy;
-- Pillow;
-- Matplotlib;
-- tqdm.
-
-### Create an environment
+Requirements: Python 3.10+, PyTorch 2.2+, torchvision 0.17+, a CUDA GPU (recommended).
 
 ```bash
+git clone https://github.com/ImranKhalid-IT/Beyond-Single-Object-Saliency-Explaining-Joint-Object-Pair-Confidence-via-Latent-Evidence-Intervent.git
+cd Beyond-Single-Object-Saliency-Explaining-Joint-Object-Pair-Confidence-via-Latent-Evidence-Intervent
+
 python -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+pip install torch torchvision numpy pillow matplotlib scikit-learn opencv-python scipy tqdm pycocotools
+pip install ultralytics            # YOLOv5
+pip install 'git+https://github.com/facebookresearch/detectron2.git'   # Faster R-CNN
 ```
 
-Activate it:
+### Detector checkpoints (public COCO weights)
+
+| Detector | Checkpoint | Source | COCO mAP |
+|---|---|---|---|
+| YOLOv5x | `yolov5x.pt` | Ultralytics | 50.7 |
+| Faster R-CNN R101-FPN 3x | `faster_rcnn_R_101_FPN_3x` (`model_final_f6e8b1.pkl`) | Detectron2 Model Zoo | 42.0 |
+| DETR-DC5 R50 | `detr-r50-dc5-f0fb7ef5.pth` | Official DETR repository | 43.3 |
+
+All detectors are kept frozen.
+
+---
+
+## Datasets
+
+| Dataset | Use | Download |
+|---|---|---|
+| MS-COCO 2017 validation | Main benchmark: 4,955 co-occurring detection pairs | https://cocodataset.org/ |
+| Visual Genome | 1,200 pairs: 600 with an annotated predicate, 600 co-occurring pairs without one (box IoU < 0.1) | https://visualgenome.org/ |
+
+MS-COCO class pairs used in the benchmark:
+
+| Class pair | Pairs |
+|---|---|
+| person + bicycle | 1,520 |
+| person + laptop | 1,285 |
+| car + traffic light | 2,150 |
+| **Total** | **4,955** |
+
+Visual Genome predicate annotations are used **only** to stratify pairs. PIE does not predict or explain predicates.
+
+Suggested layout:
+
+```
+data/
+├── coco/
+│   ├── val2017/
+│   └── annotations/instances_val2017.json
+└── visual_genome/
+    ├── images/
+    └── relationships.json
+```
+
+---
+
+## Usage
+
+### Single-pair demo
 
 ```bash
-# Windows
-.venv\Scripts\activate
-
-# Linux or macOS
-source .venv/bin/activate
+python demo_rce.py --image Test_Image.png
 ```
 
-Install dependencies:
+The demo detects objects, selects a target pair, computes the union region, discovers $K$ latent units, runs the $K$ interventions, and saves the unit maps, the masks and the $CE_k$ ranking.
+
+### Full evaluation
 
 ```bash
-pip install -r requirements.txt
+python pie_full_eval_colab.py
 ```
 
-The first pretrained run downloads the torchvision Faster R-CNN weights.
+This reproduces the pair-level MoRF-AUC and insertion results, the ablation and spatial controls, the hyperparameter sweeps, and the replacement-operator robustness study.
 
----
-
-## 8. Input preparation
-
-### Input image
-
-Use an RGB image containing the target object pair:
-
-```text
-data/person_bicycle.jpg
-```
-
-### RCE and CRAFT maps
-
-Accepted heatmap formats:
-
-- `.npy` containing a two-dimensional array;
-- a grayscale image readable by Pillow.
-
-Examples:
-
-```python
-import numpy as np
-
-np.save("results/rce.npy", rce_heatmap.astype(np.float32))
-np.save("results/craft_official.npy", craft_heatmap.astype(np.float32))
-```
-
-The map can have a different spatial resolution from the input image. It will be resized using bilinear interpolation and normalized by the shared loader.
-
-The heatmap must be two-dimensional after squeezing singleton dimensions.
-
----
-
-## 9. Running the benchmark
-
-### Automatic target selection
-
-The script selects the highest-confidence person and bicycle detections above the score threshold:
+### Qualitative figures
 
 ```bash
-python run_comparison.py \
-  --image data/person_bicycle.jpg \
-  --rce-map results/rce.npy \
-  --craft-map results/craft_official.npy \
-  --drise-masks 2000 \
-  --output outputs/figure9_baseline_comparison
+python pie_fig15_grid_v2.py     # multi-example qualitative figure
+python comperision.py           # PIE vs. baselines on one pair
 ```
 
-### Manual fixed boxes
-
-Manual boxes are recommended when exact target consistency is required across repeated experiments:
-
-```bash
-python run_comparison.py \
-  --image data/person_bicycle.jpg \
-  --person-box 170,45,330,360 \
-  --bicycle-box 85,210,420,430 \
-  --rce-map results/rce.npy \
-  --craft-map results/craft_official.npy \
-  --drise-masks 2000 \
-  --output outputs/figure9_baseline_comparison
-```
-
-Box format:
-
-```text
-x1,y1,x2,y2
-```
-
-Both boxes must be supplied together.
-
-### CPU execution
-
-```bash
-python run_comparison.py \
-  --image data/person_bicycle.jpg \
-  --device cpu \
-  --rce-map results/rce.npy \
-  --craft-map results/craft_official.npy
-```
-
-D-RISE can be slow on CPU because it requires many masked detector evaluations.
+> Check each script's header or `--help` for the exact arguments and data paths.
 
 ---
 
-## 10. Main command-line options
+## Evaluation protocol
 
-| Option | Meaning | Default |
-|---|---|---:|
-| `--image` | Input image path | required |
-| `--output` | Output filename prefix | `outputs/baseline_comparison` |
-| `--device` | `cuda` or `cpu` | CUDA when available |
-| `--person-box` | Fixed person box | automatic |
-| `--bicycle-box` | Fixed bicycle box | automatic |
-| `--score-threshold` | Minimum automatic detection score | `0.25` |
-| `--drise-masks` | Number of D-RISE masks | `1000` |
-| `--drise-batch` | D-RISE inference batch size | `8` |
-| `--seed` | Random seed for D-RISE masks | `17` |
-| `--finer-alpha` | Finer-CAM contrast strength | `0.7` |
-| `--finer-references` | Number of reference classes | `3` |
-| `--rce-map` | External RCE heatmap | optional |
-| `--craft-map` | External official CRAFT heatmap | optional |
-| `--no-pretrained` | Disable pretrained weights for code testing | false |
+**Pair-level MoRF deletion.** Every method gives a ranking of the pixels in $\Omega_{ij}$. For PIE, pixels covered by a mask take the rank of the highest-ranked covering unit; other pixels take the rank of their dominant unit. At each fraction $\alpha$, the top $\lfloor\alpha|\Omega_{ij}|\rfloor$ pixels are replaced with the **same** Gaussian-blurred image for all methods, the detector is re-run, the pair is matched, and
 
-`--no-pretrained` is not appropriate for scientific comparison because an untrained detector does not provide meaningful explanations.
+$$\mathrm{MoRF\text{-}AUC} = \int_0^1 \frac{S(\alpha)}{S(0)}\,d\alpha \qquad (\text{lower is better}).$$
+
+**Insertion AUC.** $\Omega_{ij}$ starts fully blurred and pixels are restored in ranking order (higher is better).
+
+**Baselines.** D-RISE, ODAM and Finer-CAM explain $d_i$ and $d_j$ separately, and their normalized maps are averaged. GCE and CRAFT are restricted to $\Omega_{ij}$, and CoE features are aligned with $\Omega_{ij}$. Finer-CAM was not evaluated on DETR.
 
 ---
 
-## 11. Outputs
+## Main results
 
-A standard run creates:
+### Faithfulness on 4,955 MS-COCO pairs (MoRF-AUC ↓)
 
-```text
-outputs/figure9_baseline_comparison.pdf
-outputs/figure9_baseline_comparison.png
-outputs/figure9_baseline_comparison.json
-outputs/figure9_baseline_comparison_maps/
-```
+| Method | YOLOv5 | Faster R-CNN | DETR | Mean |
+|---|---|---|---|---|
+| Finer-CAM | 0.51 | 0.48 | – | 0.50* |
+| CRAFT | 0.48 | 0.46 | 0.52 | 0.49 |
+| D-RISE | 0.45 | 0.42 | 0.49 | 0.45 |
+| GCE | 0.43 | 0.45 | 0.47 | 0.45 |
+| CoE | 0.41 | 0.42 | 0.43 | 0.42 |
+| ODAM | 0.38 | 0.40 | 0.42 | 0.40 |
+| **PIE (ours)** | **0.25** | **0.23** | **0.27** | **0.25** |
 
-The map directory contains:
+\*Mean over the two evaluated detectors.
 
-```text
-drise.npy
-odam.npy
-finer_cam_detector_adapted.npy
-```
+### Effect-based vs. first-order ranking of the same units
 
-The JSON file records:
+| Detector | PIE MoRF ↓ | First-order MoRF ↓ | PIE Insertion ↑ | First-order Insertion ↑ |
+|---|---|---|---|---|
+| YOLOv5 | **0.25** | 0.28 | **0.72** | 0.68 |
+| Faster R-CNN | **0.23** | 0.26 | **0.74** | 0.70 |
+| DETR | **0.27** | 0.30 | **0.70** | 0.66 |
+| **Mean** | **0.25** | 0.28 | **0.72** | 0.68 |
 
-- detector name;
-- selected boxes;
-- D-RISE mask count and seed;
-- Finer-CAM adaptation parameters;
-- method-status notes.
+### Ablation and spatial controls (mean MoRF-AUC ↓)
 
-The metadata file should be retained with every reported figure.
+| Variant | MoRF-AUC |
+|---|---|
+| Detector baseline | 0.45 |
+| Random spatial masking | 0.41 |
+| Pair-union attribution | 0.38 |
+| PC-Grid ($8\times8$ cells, $CE$ ranking) | 0.36 |
+| Latent units, activation-ranked | 0.31 |
+| Latent units, first-order-ranked | 0.28 |
+| **PIE (latent units, $CE_k$-ranked)** | **0.25** |
 
----
+The 0.06 gain of effect-based over activation-based ranking splits into 0.03 from the first-order terms and 0.03 from the cross term.
 
-## 12. Reproducibility recommendations
+### Robustness to the replacement operator
 
-Use the same:
+| Replacement | MoRF-AUC ↓ | Spearman ρ ↑ | Latency (s) |
+|---|---|---|---|
+| Gaussian blur (default) | 0.250 | 1.00 | 0.82 |
+| Mean replacement | 0.263 | 0.91 | 0.84 |
+| Uniform noise | 0.265 | 0.89 | 0.83 |
+| Structure-preserving inpainting | 0.271 | 0.87 | 1.05 |
 
-- input image file;
-- detector checkpoint;
-- target boxes;
-- device type where practical;
-- D-RISE seed;
-- number of D-RISE masks;
-- RCE clustering seed;
-- RCE concept number `K`;
-- RCE feature layer;
-- intervention threshold;
-- image preprocessing;
-- heatmap normalization.
+### Explanation time per pair (seconds)
 
-Recommended seed setup for the external RCE pipeline:
+| Method | YOLOv5 | Faster R-CNN | DETR |
+|---|---|---|---|
+| D-RISE | 15.21 | 18.45 | 22.10 |
+| CoE | 1.25 | 1.42 | 1.65 |
+| CRAFT | 0.82 | 0.90 | 0.98 |
+| ODAM | 0.35 | 0.42 | 0.50 |
+| **PIE (ours)** | **0.75** | **0.82** | **0.95** |
 
-```python
-import os
-import random
-import numpy as np
-import torch
+### Visual Genome (1,200 pairs)
 
-SEED = 17
-os.environ["PYTHONHASHSEED"] = str(SEED)
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
+- MoRF-AUC: **PIE 0.28** vs. ODAM 0.43.
+- Largest effect per pair, $CE_{\max}$: 0.214 (s.d. 0.082) for predicate-annotated pairs and 0.083 (s.d. 0.041) for non-annotated pairs (IoU < 0.1).
 
-# Optional stricter determinism; may reduce speed or reject some operations.
-torch.backends.cudnn.benchmark = False
-torch.backends.cudnn.deterministic = True
-```
-
-Exact floating-point equality across different GPUs, CUDA versions, or library versions is not guaranteed. Functional consistency should be evaluated using spatial and ranking metrics rather than requiring every pixel to be numerically identical.
+This comparison is descriptive: initial confidence and spatial separation also differ between the two groups, so it does not show that PIE detects relationships.
 
 ---
 
-## 13. Fair-comparison rules
+## Limitations
 
-For publication-quality use:
-
-1. Use the same image and selected target boxes for every method.
-2. Keep detector weights frozen.
-3. Do not manually modify individual heatmaps.
-4. Do not apply method-specific smoothing or sharpening.
-5. Use one resizing and normalization pipeline.
-6. Report unsupported method-detector combinations as `N/A`.
-7. Clearly distinguish official implementations from adaptations.
-8. Record all random seeds and hyperparameters.
-9. Retain raw `.npy` maps and metadata.
-10. Do not select examples only because they make one method look better.
-
-A qualitative panel should illustrate behavior; it should not replace quantitative faithfulness evaluation.
+- **Scope:** PIE explains $S_{ij}$; it does not predict, explain, or verify predicates.
+- **Coverage:** three MS-COCO class pairs, a 1,200-pair Visual Genome subset, and one detector per family. Other detectors need an analogous readout adapter.
+- **Protocol:** baselines are adapted to the pair setting; the metric shares PIE's replacement operator; $K$, $\sigma$ and the mask percentile were selected on the evaluation pairs.
+- **Units:** units are image-specific prototypes; unit names shown in figures are manually assigned display tags. All replacement operators are synthetic, so $CE_k$ measures the model's response to an intervention, not to a physical scene change.
+- **Cost:** $K+1$ forward passes per pair; all pairs among $n$ detections need $n(n-1)/2$ explanations, so PIE targets selected pairs rather than exhaustive analysis of crowded scenes.
 
 ---
 
-## 14. How to interpret the maps
+## Citation
 
-A concentrated map indicates that a method assigns high relevance to a limited image region. A diffuse map indicates broader relevance distribution. Neither pattern is automatically correct.
-
-Interpret a map together with:
-
-- the selected target pair;
-- detector confidence;
-- deletion/AOC behavior;
-- stability across seeds;
-- localization overlap;
-- concept-effect ranking;
-- known limitations of the method.
-
-RCE explains evidence associated with the selected detector output. It does not independently prove that a real-world semantic relationship exists between the detected objects.
-
----
-
-## 15. Known limitations
-
-- The current script is configured for a person-bicycle pair.
-- The shared detector is Faster R-CNN ResNet-50 FPN v2.
-- ODAM and Finer-CAM are detector-adapted implementations.
-- Official CRAFT and RCE maps must be generated externally.
-- D-RISE runtime increases with the number of masks.
-- Fixed target boxes avoid differentiating through NMS but explain the selected ROI classification responses rather than the complete end-to-end proposal-selection process.
-- Numeric concept IDs are not global semantic labels.
-- A visually plausible map is not sufficient evidence of faithfulness.
-
----
-
-## 16. Extending the code to another object pair
-
-The current automatic labels use COCO IDs:
-
-```text
-person = 1
-bicycle = 2
-```
-
-To support another pair, modify the label IDs and names passed to `select_best_pair` in `run_comparison.py`, or refactor them into command-line options.
-
-Example concept:
-
-```python
-targets = select_best_pair(
-    model,
-    image,
-    first_label=1,   # person
-    second_label=73, # laptop in the torchvision COCO label convention
-    score_threshold=0.25,
-)
-```
-
-Always verify the class-ID convention used by the detector weights before changing labels.
-
----
-
-## 17. Troubleshooting
-
-### No person or bicycle detection found
-
-Lower the threshold cautiously:
-
-```bash
---score-threshold 0.15
-```
-
-Or provide both target boxes manually.
-
-### CUDA out-of-memory during D-RISE
-
-Reduce the batch size:
-
-```bash
---drise-batch 2
-```
-
-The mask count controls sampling quality, while the batch size mainly controls memory use.
-
-### Heatmap shape error
-
-Ensure the supplied file becomes a two-dimensional array after `numpy.squeeze`:
-
-```python
-print(np.load("results/rce.npy").shape)
-```
-
-Valid examples include:
-
-```text
-(H, W)
-(1, H, W)
-(H, W, 1)
-```
-
-### RCE concept numbers change between runs
-
-This is usually cluster-label permutation. Compare spatial maps and concept-effect rankings, set a fixed seed, and use optimal cluster matching before concluding that the explanation is unstable.
-
-### Output appears blank
-
-Check whether the raw heatmap contains meaningful variation:
-
-```python
-heatmap = np.load("results/rce.npy")
-print(heatmap.min(), heatmap.max(), heatmap.std())
-```
-
-A constant map normalizes to zeros.
-
----
-
-## 18. Suggested figure caption
-
-```latex
-\caption{Qualitative comparison of RCE with CRAFT, Finer-CAM,
-D-RISE, and ODAM for a selected person--bicycle pair. All explanation
-maps were generated or imported for the same frozen detector output and
-processed using an identical resizing, normalization, and visualization
-protocol.}
-```
-
----
-
-## 19. Citation
-
-When the associated RCE manuscript is publicly available, replace the placeholder below with its final bibliographic record:
+If you use this code, please cite:
 
 ```bibtex
-@article{rce_relational_concept_explainer,
-  title   = {RCE: Deconstructing Object Relationships through Architecture-Agnostic Concept Interventions},
-  author  = {Khalid, Muhammad Imran and Mi, Jian-Xun and others},
-  journal = {To be updated},
+@article{khalid2026pie,
+  title   = {Beyond Single-Object Saliency: Explaining Joint Object-Pair Confidence via Latent Evidence Interventions},
+  author  = {Khalid, Muhammad Imran},
+  journal = {IEEE Access},
+  note    = {Under review},
   year    = {2026}
 }
 ```
 
-Users should also cite the original papers for each baseline they use.
+Related work by the author:
 
+```bibtex
+@article{khalid2026interpretable,
+  title   = {Interpretable Object Detection via Integrated Heatmap, Concept Attribution, and {Sobol} Sensitivity Analysis},
+  author  = {Khalid, Muhammad Imran and Mi, Jian-Xun and Ali, G and Ali, Tariq and Hijji, M and Ayaz, M},
+  journal = {Information Sciences},
+  pages   = {123133},
+  year    = {2026}
+}
+
+@inproceedings{khalid2025global,
+  title     = {Global Concept-Based Explanations ({GCE}): A Universal Concept Dictionary for Interpretable Object Detection},
+  author    = {Khalid, M I and Mi, J-X and Komal, A and Sarwar, N and Attique, D},
+  booktitle = {2025 IEEE 19th International Conference on Open Source Systems and Technologies (ICOSST)},
+  pages     = {1--6},
+  year      = {2025},
+  doi       = {10.1109/ICOSST69113.2025.11315337}
+}
+
+@article{khalid2026decomposing,
+  title   = {Decomposing Decisions: Causal Concept Explanations for Deep Learning Models},
+  author  = {Khalid, Muhammad Imran and Mi, Jian-Xun},
+  journal = {Journal of Experimental \& Theoretical Artificial Intelligence},
+  pages   = {1--19},
+  year    = {2026},
+  doi     = {10.1080/0952813X.2026.2701277}
+}
+```
 
 ---
 
-TESTING BENCH MARK — PRIVATE ACCESS DETAILS
+## Acknowledgment
 
-Archive password: nX9z1x5POOd6Qc3xF8yfH8jB
-Runtime access key: TBM-mlMAzuFn8hP0gWIiKnk6I0wcwu-F1cIG
+The author thanks Prof. Jian-Xun Mi for his supervision, guidance, and continuous support throughout this research.
 
-Keep this file separate. Anyone with both values can extract and run the project.
+We thank the authors of [YOLOv5](https://github.com/ultralytics/yolov5), [Detectron2](https://github.com/facebookresearch/detectron2), [DETR](https://github.com/facebookresearch/detr), [MS-COCO](https://cocodataset.org/) and [Visual Genome](https://visualgenome.org/) for making their models and data public.
 
+## Contact
 
-ad4e04eaf9f92f7b34f79f9266e379c4e77bbc939c2dd1ef9ecbdc5c2f6424ad  /mnt/data/Testing Bench Mark.zip
-30e1a56ab37394c7353df795ec42825ffcb932ea2c70247ffd5a1be17b921cd5  /mnt/data/Testing Bench Mark.ipynb
-02e1c687141abb0d91e86c95b998de22342bfe86b85eafe133897dde344a3e12  /mnt/data/Testing Bench Mark Access.txt
-
-## 20. License and responsible use
-
-Add a repository license before public release, for example `LICENSE` using MIT, Apache-2.0, or the license required by the project institution.
-
-Third-party methods, model weights, and datasets remain subject to their original licenses. This repository does not transfer ownership of external implementations or data.
-
-The software is intended for research and evaluation. Explanation maps should not be treated as proof of physical causation or used as the sole basis for safety-critical decisions.
-
----
-
-## 21. Contact
-
-For questions, bug reports, or reproducibility issues, open a GitHub issue and include:
-
-- operating system;
-- Python version;
-- PyTorch and torchvision versions;
-- GPU and CUDA version;
-- complete command;
-- metadata JSON;
-- error traceback;
-- a minimal reproducible example where possible.
-
-Owner G.mail
-Contact Email.imran.khalid292@gmail.com
-Token:CAUSAL_LAB_ACCESS_TOKEN=0ze0fkN5YiXnreuwjMzugCd2r8ghYmoC
-face any problem Contact with me via Email
+For questions, please open an issue in this repository.
